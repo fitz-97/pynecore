@@ -236,6 +236,7 @@ class Position:
     size: float = 0.0
     sign: float = 0.0
     avg_price: float = 0.0
+    prev_c: float = 0.0
 
     cum_profit: float | NA[float] = 0.0
 
@@ -691,6 +692,7 @@ class Position:
         self.h = round_to_mintick(lib.high)
         self.l = round_to_mintick(lib.low)
         self.c = round_to_mintick(lib.close)
+        self.prev_c = round_to_mintick(self.prev_c)
 
         # Get script reference for slippage
         script = lib._script
@@ -735,13 +737,13 @@ class Position:
             # Market orders
             if order.is_market_order:
                 # Apply slippage to market orders
-                fill_price = self.o
+                fill_price = self.prev_c
                 if script.slippage > 0:
                     # Slippage is in ticks, always adverse to trade direction
                     # For long orders (buying), slippage increases the price
                     # For short orders (selling), slippage decreases the price
                     slippage_amount = syminfo.mintick * script.slippage * order.sign
-                    fill_price = self.o + slippage_amount
+                    fill_price = self.prev_c + slippage_amount
 
                 # open → high → low → close
                 if ohlc:
