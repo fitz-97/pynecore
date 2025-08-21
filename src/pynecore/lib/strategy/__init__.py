@@ -1,4 +1,4 @@
-from typing import cast, TYPE_CHECKING
+from typing import cast, TYPE_CHECKING, Any
 
 import math
 from datetime import datetime, UTC
@@ -360,7 +360,11 @@ class Position:
                     if closed_trade.size != -size:
                         # Modify commission
                         trade.commission *= size_ratio
-                        closed_trade.commission *= (1 - size_ratio)
+                        if commission_type == _commission.percent:
+                            closed_trade.commission *= (1 - size_ratio) * commission_value * 0.01 * price
+                        else:
+                            closed_trade.commission *= (1 - size_ratio)
+
                         # Modify drawdown and runup
                         trade.max_drawdown *= size_ratio
                         trade.max_runup *= size_ratio
@@ -407,7 +411,7 @@ class Position:
                         commission = abs(size) * commission_value
 
                         if commission_type == _commission.percent:
-                            commission *= 0.01
+                            commission *= 0.01 * price
                         closed_trade.commission += commission
                         # Realize commission
                         self.netprofit -= commission
@@ -491,7 +495,7 @@ class Position:
                 if commission_type == _commission.cash_per_order:
                     commission = commission_value
                 elif commission_type == _commission.percent:
-                    commission = abs(order.size) * commission_value * 0.01
+                    commission = abs(order.size) * commission_value * 0.01 * price
                 elif commission_type == _commission.cash_per_contract:
                     commission = abs(order.size) * commission_value
                 else:  # Should not be here!
@@ -622,7 +626,7 @@ class Position:
         if ((order.order_type == _order_type_close and order.size > 0) or (
                 order.order_type == _order_type_entry and order.size > 0)) and order.stop <= self.h:
             p = max(order.stop, self.o)
-            self.fill_order(order, p, p, self.l)
+            self.fill_order(order, order.stop, p, self.l)
 
     def _check_high(self, order: Order):
         """ Check high limit """
@@ -630,7 +634,7 @@ class Position:
             if ((order.order_type == _order_type_close and order.size < 0) or (
                     order.order_type == _order_type_entry and order.size < 0)) and order.limit <= self.h:
                 p = max(order.limit, self.o)
-                self.fill_order(order, p, p, self.l)
+                self.fill_order(order, order.limit, p, self.l)
 
         # Update trailing stop
         if order.trail_price is not None and order.sign < 0:
@@ -640,7 +644,7 @@ class Position:
             # Update stop if trailing price has been triggered
             if order.trail_triggered:
                 offset_price = syminfo.mintick * order.trail_offset
-                order.stop = max(lib.math.round_to_mintick(self.h - offset_price), order.stop)  # type: ignore
+                order.stop = max(lib.math.round_to_mintick(order.trail_price - offset_price), order.stop)  # type: ignore
 
     def _check_low_stop(self, order: Order):
         """ Check low stop """
@@ -649,7 +653,7 @@ class Position:
         if ((order.order_type == _order_type_close and order.size < 0) or (
                 order.order_type == _order_type_entry and order.size < 0)) and order.stop >= self.l:
             p = min(self.o, order.stop)
-            self.fill_order(order, p, self.h, p)
+            self.fill_order(order, order.stop, self.h, p)
 
     def _check_low(self, order: Order):
         """ Check low limit """
@@ -657,7 +661,7 @@ class Position:
             if ((order.order_type == _order_type_close and order.size > 0) or (
                     order.order_type == _order_type_entry and order.size > 0)) and order.limit >= self.l:
                 p = min(self.o, order.limit)
-                self.fill_order(order, p, self.h, p)
+                self.fill_order(order, order.limit, self.h, p)
 
         # Update trailing stop
         if order.trail_price is not None and order.sign > 0:
@@ -667,7 +671,7 @@ class Position:
             # Update stop if trailing price has been triggered
             if order.trail_triggered:
                 offset_price = syminfo.mintick * order.trail_offset
-                order.stop = min(lib.math.round_to_mintick(self.l + offset_price), order.stop)  # type: ignore
+                order.stop = min(lib.math.round_to_mintick(order.trail_price + offset_price), order.stop)  # type: ignore
 
     def _check_close(self, order: Order, ohlcv: bool):
         """ Check close price if trailing stop is triggered """
@@ -714,17 +718,17 @@ class Position:
                     direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
 
                     # Calculate limit from profit_ticks if specified
-                    if order.profit_ticks is not None and order.limit is None:
+                    if order.profit_ticks is not None and _is_none(order.limit):
                         order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
                         order.limit = _price_round(order.limit, direction)
 
                     # Calculate stop from loss_ticks if specified
-                    if order.loss_ticks is not None and order.stop is None:
+                    if order.loss_ticks is not None and _is_none(order.stop):
                         order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
                         order.stop = _price_round(order.stop, -direction)
 
                     # Calculate trail_price from trail_points_ticks if specified
-                    if order.trail_points_ticks is not None and order.trail_price is None:
+                    if order.trail_points_ticks is not None and _is_none(order.trail_price):
                         order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
                         order.trail_price = _price_round(order.trail_price, direction)
 
@@ -758,12 +762,12 @@ class Position:
                     self._check_low(order)
 
         # 2nd round of process open orders
-        for order in list(chain(self.entry_orders.values(), self.exit_orders.values())):
+        for order in list(self.entry_orders.values()) + list(self.exit_orders.values()):
             # For exit orders, calculate limit/stop from entry price if not already done
             if order.order_type == _order_type_close and order.order_id:
                 # Only recalculate if not already set in first round
                 if ((order.profit_ticks is not None or order.loss_ticks is not None
-                     or order.trail_points_ticks is not None) and order.limit is None and order.stop is None):
+                     or order.trail_points_ticks is not None) and _is_none(order.limit) and _is_none(order.stop)):
                     # Try to find the trade with matching entry_id
                     entry_price = None
                     for trade in self.open_trades:
@@ -777,17 +781,17 @@ class Position:
                         direction = 1.0 if order.size < 0 else -1.0  # Exit order size is negative of position
 
                         # Calculate limit from profit_ticks if specified
-                        if order.profit_ticks is not None and order.limit is None:
+                        if order.profit_ticks is not None and _is_none(order.limit):
                             order.limit = entry_price + direction * syminfo.mintick * order.profit_ticks
                             order.limit = _price_round(order.limit, direction)
 
                         # Calculate stop from loss_ticks if specified
-                        if order.loss_ticks is not None and order.stop is None:
+                        if order.loss_ticks is not None and _is_none(order.stop):
                             order.stop = entry_price - direction * syminfo.mintick * order.loss_ticks
                             order.stop = _price_round(order.stop, -direction)
 
                         # Calculate trail_price from trail_points_ticks if specified
-                        if order.trail_points_ticks is not None and order.trail_price is None:
+                        if order.trail_points_ticks is not None and _is_none(order.trail_price):
                             order.trail_price = entry_price + direction * syminfo.mintick * order.trail_points_ticks
                             order.trail_price = _price_round(order.trail_price, direction)
 
@@ -917,6 +921,15 @@ def _price_round(price: float | NA[float], direction: int | float) -> float | NA
             # Not an integer, round up
             return (ppmt_int + 1) * mintick
 
+
+def _is_none(value: Any) -> bool:
+    """
+    Check if the value is None or NA
+
+    :param value: The value to check
+    :return: True if the value is None or NA, False otherwise
+    """
+    return isinstance(value, NA) or value is None
 
 # noinspection PyShadowingBuiltins,PyProtectedMember
 def cancel(id: str):
