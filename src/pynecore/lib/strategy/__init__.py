@@ -758,7 +758,7 @@ class Position:
                     self._check_low(order)
 
         # 2nd round of process open orders
-        for order in list(self.entry_orders.values()) + list(self.exit_orders.values()):
+        for order in list(chain(self.entry_orders.values(), self.exit_orders.values())):
             # For exit orders, calculate limit/stop from entry price if not already done
             if order.order_type == _order_type_close and order.order_id:
                 # Only recalculate if not already set in first round
@@ -1125,7 +1125,8 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
 
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
-    size = qty * direction_sign
+    margin: float = (script.margin_short if direction == short else script.margin_long)
+    size = qty * direction_sign / margin
     sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
 
     # Check pyramiding limit (only for same direction trades)
