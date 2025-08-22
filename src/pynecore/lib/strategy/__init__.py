@@ -627,7 +627,7 @@ class Position:
         if ((order.order_type == _order_type_close and order.size > 0) or (
                 order.order_type == _order_type_entry and order.size > 0)) and order.stop <= self.h:
             p = max(order.stop, self.o)
-            self.fill_order(order, order.stop, p, self.l)
+            self.fill_order(order, p, p, self.l)
 
     def _check_high(self, order: Order):
         """ Check high limit """
@@ -635,7 +635,7 @@ class Position:
             if ((order.order_type == _order_type_close and order.size < 0) or (
                     order.order_type == _order_type_entry and order.size < 0)) and order.limit <= self.h:
                 p = max(order.limit, self.o)
-                self.fill_order(order, order.limit, p, self.l)
+                self.fill_order(order, p, p, self.l)
 
         # Update trailing stop
         if order.trail_price is not None and order.sign < 0:
@@ -645,7 +645,7 @@ class Position:
             # Update stop if trailing price has been triggered
             if order.trail_triggered:
                 offset_price = syminfo.mintick * order.trail_offset
-                order.stop = max(lib.math.round_to_mintick(order.trail_price - offset_price), order.stop)  # type: ignore
+                order.stop = max(lib.math.round_to_mintick(self.h - offset_price), order.stop)  # type: ignore
 
     def _check_low_stop(self, order: Order):
         """ Check low stop """
@@ -654,7 +654,7 @@ class Position:
         if ((order.order_type == _order_type_close and order.size < 0) or (
                 order.order_type == _order_type_entry and order.size < 0)) and order.stop >= self.l:
             p = min(self.o, order.stop)
-            self.fill_order(order, order.stop, self.h, p)
+            self.fill_order(order, p, self.h, p)
 
     def _check_low(self, order: Order):
         """ Check low limit """
@@ -662,7 +662,7 @@ class Position:
             if ((order.order_type == _order_type_close and order.size > 0) or (
                     order.order_type == _order_type_entry and order.size > 0)) and order.limit >= self.l:
                 p = min(self.o, order.limit)
-                self.fill_order(order, order.limit, self.h, p)
+                self.fill_order(order, p, self.h, p)
 
         # Update trailing stop
         if order.trail_price is not None and order.sign > 0:
@@ -672,7 +672,7 @@ class Position:
             # Update stop if trailing price has been triggered
             if order.trail_triggered:
                 offset_price = syminfo.mintick * order.trail_offset
-                order.stop = min(lib.math.round_to_mintick(order.trail_price + offset_price), order.stop)  # type: ignore
+                order.stop = min(lib.math.round_to_mintick(self.l + offset_price), order.stop)  # type: ignore
 
     def _check_close(self, order: Order, ohlcv: bool):
         """ Check close price if trailing stop is triggered """
