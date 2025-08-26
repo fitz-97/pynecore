@@ -1,3 +1,4 @@
+from decimal import Decimal, ROUND_FLOOR
 from typing import cast, TYPE_CHECKING, Any
 
 import math
@@ -860,19 +861,53 @@ class Position:
             assert lib._script is not None
             initial_capital = lib._script.initial_capital
             for closed_trade in self.new_closed_trades:
+                # closed_trade.profit = closed_trade.size * (closed_trade.exit_price - closed_trade.entry_price) - closed_trade.commission
                 previous_cum_profit = self.cum_profit - closed_trade.profit
+
+                # hprofit = closed_trade.size * (self.h - closed_trade.entry_price) - closed_trade.commission
+                # lprofit = closed_trade.size * (self.l - closed_trade.entry_price) - closed_trade.commission
+                # exit_point = closed_trade.size * (closed_trade.exit_price - closed_trade.entry_price) - closed_trade.commission
+                # # Drawdown
+                # drawdown = -min(hprofit, exit_point, lprofit, 0.0)
+                closed_trade.max_drawdown = -min(closed_trade.profit, -closed_trade.max_drawdown, 0.0)
+                closed_trade.max_runup = max(closed_trade.profit, closed_trade.max_runup, 0.0)
+                # # Runup
+                # runup = max(hprofit, exit_point, lprofit, 0.0)
+                # closed_trade.max_runup = max(runup, closed_trade.max_runup)
 
                 self.cum_profit = self.equity - lib._script.initial_capital - self.openprofit
                 closed_trade.cum_profit = self.cum_profit
                 closed_trade.cum_max_drawdown = self.max_drawdown
                 closed_trade.cum_max_runup = self.max_runup
 
+                if closed_trade.entry_bar_index == closed_trade.exit_bar_index:
+                    hprofit = closed_trade.size * (self.h - closed_trade.entry_price) - closed_trade.commission
+                    lprofit = closed_trade.size * (self.l - closed_trade.entry_price) - closed_trade.commission
+                    closed_trade.max_drawdown = min(-min(hprofit, lprofit, 0.0), closed_trade.profit)
+                    closed_trade.max_runup = min(max(hprofit, lprofit, 0.0), closed_trade.profit)
+
+                # If entry and exit are on the same bar, calculate drawdown and runup
+                trade_value = abs(closed_trade.size) * closed_trade.entry_price
+                closed_trade.max_drawdown_percent = max(
+                    (closed_trade.max_drawdown / trade_value) * 100.0 if closed_trade.max_drawdown > 0 else 0.0,
+                    closed_trade.max_drawdown_percent
+                )
+
+                # Calculate runup percentage
+                closed_trade.max_runup_percent = max(
+                    (closed_trade.max_runup / trade_value) * 100.0 if closed_trade.max_runup > 0 else 0.0,
+                    closed_trade.max_runup_percent
+                )
+
+
                 # Cumulative profit percent
                 denominator = initial_capital + previous_cum_profit
                 try:
                     closed_trade.cum_profit_percent = (closed_trade.profit / denominator) * 100.0
+                    closed_trade.profit_percent = (closed_trade.profit / (closed_trade.size * closed_trade.entry_price)) * 100.0
                 except ZeroDivisionError:
                     closed_trade.cum_profit_percent = 0.0
+                    closed_trade.profit_percent = 0.0
 
                 # Modify entry equity, for max drawdown and runup
                 self.entry_equity += closed_trade.profit
@@ -890,10 +925,17 @@ def _size_round(qty: float) -> float:
     :param qty: The quantity to round
     :return: The rounded quantity
     """
+    # rfactor = syminfo._size_round_factor  # noqa
+    # qrf = int(abs(qty) * rfactor * 10.0) * 0.1  # We need to floor to one decimal place
+    # sign = 1 if qty > 0 else -1
+    # return sign * int(qrf) / rfactor
     rfactor = syminfo._size_round_factor  # noqa
-    qrf = int(abs(qty) * rfactor * 10.0) * 0.1  # We need to floor to one decimal place
-    sign = 1 if qty > 0 else -1
-    return sign * int(qrf) / rfactor
+    rfactor_d = Decimal(str(rfactor))
+    qty_d = Decimal(str(qty))
+    sign = 1 if qty_d > 0 else -1
+    qrf = (abs(qty_d) * rfactor_d * Decimal("10"))
+    qrf = qrf.to_integral_value(rounding=ROUND_FLOOR) * Decimal("0.1")
+    return float(sign * (qrf.to_integral_value() / rfactor_d))
 
 
 # noinspection PyShadowingNames
