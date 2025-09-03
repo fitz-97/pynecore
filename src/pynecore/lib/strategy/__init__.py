@@ -81,7 +81,7 @@ class Order:
     """
 
     __slots__ = (
-        "order_id", "size", "sign", "order_type", "limit", "stop", "exit_id", "oca_name", "oca_type",
+        "order_id", "size", "sign", "order_type", "is_reverse", "limit", "stop", "exit_id", "oca_name", "oca_type",
         "comment", "alert_message",
         "trail_price", "trail_offset",
         "trail_triggered",
@@ -95,6 +95,7 @@ class Order:
             size: float,
             *,
             order_type: _OrderType,
+            is_reverse: bool | None = None,
             exit_id: str | None = None,
             limit: float | None = None,
             stop: float | None = None,
@@ -114,7 +115,7 @@ class Order:
         self.limit = limit
         self.stop = stop
         self.order_type = order_type
-
+        self.is_reverse: bool = is_reverse
         self.exit_id = exit_id
 
         self.oca_name = oca_name
@@ -489,6 +490,233 @@ class Position:
                         trade.commission += commission
 
             self.new_closed_trades.extend(new_closed_trades)
+        # Reverse with entry (use entry order to close current position and possibly open reverse)
+        elif self.size and order.order_type == _order_type_entry and order.sign != self.sign:
+            # 和上面的 Close 分支保持一致的处理与记账口径
+            delete = False
+            new_closed_trades = []
+            closed_trade_size = 0.0  # 用于 cash_per_order 的佣金分摊
+
+            # 为反向平仓生成一个自动 exit_id（不进入 self.exit_orders）
+            auto_exit_id = f"__Reverse_Exit__"
+
+            # 逐个撮合已开仓位，先平后开
+            open_trades = []
+            for trade in self.open_trades:
+                if order.size == 0.0:
+                    # 订单已被完全“消耗”，剩余不需要继续撮合
+                    open_trades.append(trade)
+                    continue
+
+                # 反向 entry 用来平仓——不限定 entry_id，FIFO 地吃掉仓位
+                delete = True
+
+                # 本次与该 trade 的可撮合数量（保持与上面 Close 分支一致的符号处理）
+                close_size = abs(trade.size) if order.is_reverse else min(abs(order.size), abs(trade.size))
+                size = -self.sign * close_size
+                order.size -= order.size if order.is_reverse else close_size * order.sign
+                pnl = -size * (price - trade.entry_price)
+                # 拷贝一份 trade 作为已平仓记录（可能是部分平）
+                closed_trade = copy(trade)
+
+                size_ratio = 1 + size / closed_trade.size
+                if closed_trade.size != -size:
+                    # 调整佣金（按比例划分原始开仓佣金）
+                    trade.commission *= size_ratio
+                    if commission_type == _commission.percent:
+                        closed_trade.commission *= (1 - size_ratio) * commission_value * 0.01 * price
+                    else:
+                        closed_trade.commission *= (1 - size_ratio)
+
+                    # 调整回撤与回升
+                    trade.max_drawdown *= size_ratio
+                    trade.max_runup *= size_ratio
+                    closed_trade.max_drawdown *= (1 - size_ratio)
+                    closed_trade.max_runup *= (1 - size_ratio)
+
+                # 计算用于回撤/回升统计的高低点盈亏（保持口径一致）
+                hprofit = (-size * (h - closed_trade.entry_price) - closed_trade.commission)
+                lprofit = (-size * (l - closed_trade.entry_price) - closed_trade.commission)
+
+                drawdown = -min(hprofit, lprofit, 0.0)
+                runup = max(hprofit, lprofit, 0.0)
+                self.drawdown_summ += drawdown
+                self.runup_summ += runup
+
+                # 设置平仓字段（使用自动的 exit_id）
+                closed_trade.size = -size
+                closed_trade.exit_id = auto_exit_id
+                closed_trade.exit_bar_index = int(lib.bar_index)
+                closed_trade.exit_time = lib._time
+                closed_trade.exit_price = price
+                closed_trade.profit = pnl
+                if order.comment:
+                    closed_trade.exit_comment = order.comment
+
+                # 统计与记账
+                new_closed_trades.append(closed_trade)
+                self.closed_trades.append(closed_trade)
+                self.closed_trades_count += 1
+
+                # 从未实现佣金中扣除对应的部分
+                self.open_commission -= closed_trade.commission
+
+                # 佣金处理：与上面 Close 分支保持一致
+                if (commission_type == _commission.cash_per_contract or
+                        commission_type == _commission.cash_per_order):
+                    closed_trade_size += abs(size)
+                else:
+                    commission = abs(size) * commission_value
+                    if commission_type == _commission.percent:
+                        commission *= 0.01 * price
+                    closed_trade.commission += commission
+                    self.netprofit -= commission
+                    closed_trade.profit -= closed_trade.commission
+
+                # 已实现盈亏
+                entry_value = abs(closed_trade.size) * closed_trade.entry_price
+                try:
+                    closed_trade.profit_percent = (pnl / entry_value) * 100.0
+                except ZeroDivisionError:
+                    closed_trade.profit_percent = 0.0
+
+                self.netprofit += pnl
+
+                # 统计盈亏计数
+                if closed_trade.profit == 0.0:
+                    self.eventrades += 1
+                elif closed_trade.profit > 0.0:
+                    self.wintrades += 1
+                    self.grossprofit += closed_trade.profit
+                else:
+                    self.losstrades += 1
+                    self.grossloss -= closed_trade.profit
+
+
+
+                # 平仓时的权益
+                closed_trade.exit_equity = self.equity
+                # 修改整体持仓数量与订单剩余数量
+                self.size += size
+                if math.isclose(self.size, 0.0, abs_tol=1 / syminfo._size_round_factor):
+                    size -= self.size
+                    self.size = 0.0
+                self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
+                trade.size += size
+                # order.size -= size  # 抵消掉本次所用的反向 entry 数量
+                # 均价与浮盈
+                if self.size:
+                    self.entry_summ -= closed_trade.entry_price * abs(closed_trade.size)
+                    self.avg_price = self.entry_summ / abs(self.size)
+                    self.openprofit = self.size * (self.c - self.avg_price)
+                else:
+                    self.avg_price = 0.0
+                    self.openprofit = 0.0
+                # 如果该 open trade 被完全吃掉，不再保留
+                if trade.size == 0.0:
+                    # 若盈利则对回撤/回升与入场权益做相同口径的调整
+                    self.entry_summ = 0.0
+                    if pnl > 0.0:
+                        self.runup_summ -= closed_trade.commission
+                        self.drawdown_summ += closed_trade.commission / 2
+                        self.entry_equity += closed_trade.commission / 2
+                    continue
+
+                if pnl > 0.0:
+                    self.runup_summ -= closed_trade.commission
+                    self.drawdown_summ += closed_trade.commission / 2
+                    self.entry_equity += closed_trade.commission / 2
+
+                open_trades.append(trade)
+
+            # 更新剩余持仓列表
+            self.open_trades = open_trades
+
+            # 如果真的有进行平仓，处理 cash_per_order 的佣金与 new_closed_trades 入列
+            if delete:
+                if commission_type == _commission.cash_per_order:
+                    self.netprofit -= commission_value
+                    # 按本次每笔平仓 size 占比对该“订单层面”的佣金做分摊
+                    for trade in new_closed_trades:
+                        commission = (commission_value * abs(trade.size)) / (closed_trade_size or 1.0)
+                        trade.commission += commission
+
+                self.new_closed_trades.extend(new_closed_trades)
+
+            # 【反手开新仓】如果 entry 反向单还有剩余数量（order.size 未被全“消耗”）
+            if order.size != 0.0 or order.is_reverse:
+                # 按 New trade 分支的口径计算入场佣金
+                if order.size == 0.0 and order.is_reverse:
+                    if script.default_qty_type == percent_of_equity:
+                        default_qty_value = script.default_qty_value
+                        equity_percent = default_qty_value * 0.01
+                        target_investment = self.equity * equity_percent
+
+                        if script.commission_type == _commission.percent:
+
+                            commission_multiplier = 1.0 + script.commission_value * 0.01
+                            qty = target_investment / (lib.close * commission_multiplier)
+
+                        elif script.commission_type == _commission.cash_per_contract:
+                            price_plus_commission = lib.close + script.commission_value
+                            qty = target_investment / price_plus_commission
+
+                        elif script.commission_type == _commission.cash_per_order:
+                            qty = (target_investment - script.commission_value) / lib.close
+                            qty = max(0.0, qty)  # Ensure non-negative
+
+                        else:
+                            qty = target_investment / lib.close
+
+                        # Round down to the nearest allowed step
+                        order.size = qty * order.sign
+
+                if commission_value:
+                    if commission_type == _commission.cash_per_order:
+                        commission = commission_value
+                    elif commission_type == _commission.percent:
+                        commission = abs(order.size) * commission_value * 0.01 * price
+                    elif commission_type == _commission.cash_per_contract:
+                        commission = abs(order.size) * commission_value
+                    else:
+                        assert False, 'Wrong commission type: ' + str(commission_type)
+                else:
+                    commission = 0.0
+
+                before_equity = self.equity
+                self.netprofit -= commission
+
+                entry_equity = self.equity
+                if not self.open_trades:
+                    self.max_equity = max(self.max_equity, entry_equity)
+                    self.min_equity = min(self.min_equity, entry_equity)
+                    self.entry_equity = entry_equity
+
+                assert order.order_id is not None
+                order.size = _size_round(order.size)
+                trade = Trade(
+                    size=order.size,
+                    entry_id=order.order_id, entry_bar_index=cast(int, lib.bar_index),
+                    entry_time=lib._time, entry_price=price,
+                    commission=commission, entry_comment=order.comment,  # type: ignore
+                    entry_equity=before_equity
+                )
+                self.open_trades.append(trade)
+                self.size += trade.size
+                self.sign = 0.0 if self.size == 0.0 else 1.0 if self.size > 0.0 else -1.0
+
+                # 均价、浮盈、未实现佣金
+                self.entry_summ += price * abs(order.size)
+                try:
+                    self.avg_price = self.entry_summ / abs(self.size)
+                except ZeroDivisionError:
+                    self.avg_price = 0.0
+                self.openprofit = self.size * (self.c - self.avg_price)
+                self.open_commission += commission
+
+            # 处理该 entry 指令（已被完全用于反向/反手），从 entry_orders 移除
+            if order.order_type == _order_type_entry and order.order_id:
+                self.entry_orders.pop(order.order_id, None)
 
         # New trade
         elif order.order_type != _order_type_close:
@@ -904,7 +1132,8 @@ class Position:
                 denominator = initial_capital + previous_cum_profit
                 try:
                     closed_trade.cum_profit_percent = (closed_trade.profit / denominator) * 100.0
-                    closed_trade.profit_percent = (closed_trade.profit / (closed_trade.size * closed_trade.entry_price)) * 100.0
+                    closed_trade.profit_percent = (closed_trade.profit / (abs(closed_trade.size) * closed_trade.entry_price)) * 100.0
+
                 except ZeroDivisionError:
                     closed_trade.cum_profit_percent = 0.0
                     closed_trade.profit_percent = 0.0
@@ -1128,7 +1357,8 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
         return
 
     # Get default qty by script parameters if no qty is specified
-    if isinstance(qty, NA):
+    qty_is_na = isinstance(qty, NA)
+    if qty_is_na:
         default_qty_type = script.default_qty_type
         if default_qty_type == fixed:
             qty = script.default_qty_value
@@ -1151,27 +1381,27 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
             if script.commission_type == _commission.percent:
                 # For percentage commission: qty * price * (1 + commission%)
                 commission_multiplier = 1.0 + script.commission_value * 0.01
-                qty = target_investment / (lib.close * syminfo.pointvalue * commission_multiplier)
+                qty = target_investment / (lib.close * commission_multiplier)
 
             elif script.commission_type == _commission.cash_per_contract:
                 # For cash per contract: qty * price + qty * commission_value
                 # qty * (price + commission_value) = target_investment
-                price_plus_commission = lib.close * syminfo.pointvalue + script.commission_value
+                price_plus_commission = lib.close + script.commission_value
                 qty = target_investment / price_plus_commission
 
             elif script.commission_type == _commission.cash_per_order:
                 # For cash per order: qty * price + commission_value = target_investment
                 # qty = (target_investment - commission_value) / price
-                qty = (target_investment - script.commission_value) / (lib.close * syminfo.pointvalue)
+                qty = (target_investment - script.commission_value) / lib.close
                 qty = max(0.0, qty)  # Ensure non-negative
 
             else:
                 # No commission
-                qty = target_investment / (lib.close * syminfo.pointvalue)
+                qty = target_investment / lib.close
 
         elif default_qty_type == cash:
             default_qty_value = script.default_qty_value
-            qty = default_qty_value / (lib.close * syminfo.pointvalue)
+            qty = default_qty_value / lib.close
 
         else:
             raise ValueError("Unknown default qty type: ", default_qty_type)
@@ -1182,10 +1412,11 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
 
     # We need a signed size instead of qty, the sign is the direction
     direction_sign: float = (-1.0 if direction == short else 1.0)
-    margin: float = (script.margin_short if direction == short else script.margin_long)
-    size = qty * direction_sign / margin
+    size = qty * direction_sign
     sign = 0.0 if size == 0.0 else 1.0 if size > 0.0 else -1.0
-
+    is_reverse = False
+    if position.size and position.sign != sign and qty_is_na and script.default_qty_type == percent_of_equity:
+        is_reverse = True
     # Check pyramiding limit (only for same direction trades)
     if position.size:
         if position.sign == sign:
@@ -1228,7 +1459,7 @@ def entry(id: str, direction: direction.Direction, qty: int | float | NA[float] 
         stop = _price_round(stop, -direction_sign)
 
     order = Order(id, size, order_type=_order_type_entry, limit=limit, stop=stop, oca_name=oca_name,
-                  oca_type=oca_type, comment=comment, alert_message=alert_message)
+                  oca_type=oca_type, comment=comment, alert_message=alert_message, is_reverse=is_reverse)
     # Store in entry_orders dict
     script.position.entry_orders[id] = order
 
